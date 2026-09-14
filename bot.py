@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Telethon bot (MTProto polling) — port fitur penuh CF Worker bypass-bot.
 
-Platform: UC Share, SliceDrive, TeraBox, Subtitle. Tanpa webhook.
+Platform: UC Share, Videy, TeraBox, Subtitle. Tanpa webhook.
 State disimpan di SQLite (db.py) agar survive restart multi-proses.
 """
 

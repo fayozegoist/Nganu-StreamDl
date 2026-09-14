@@ -998,7 +998,7 @@ MEDIA_TTL_MS = 3 * 3600 * 1000
 
 def create_media_token(url: str, stream: str | None = None, fname: str = "video.mp4",
                        exp: int | None = None, referer: str | None = None) -> str:
-    """Buat token media (UC Share / SliceDrive) untuk /m/{token}."""
+    """Buat token media (UC Share / Videy) untuk /m/{token}."""
     token = secrets.token_urlsafe(14)
     db.kv_set(f"dl:{token}", {
         "url": url,
