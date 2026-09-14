@@ -55,7 +55,7 @@ PAGE_TTL = 10 * 60 * 1000
 ICONS = {"video": "\U0001F3AC", "audio": "\U0001F3B5", "photo": "\U0001F5BC\uFE0F", "file": "\U0001F4C4"}
 PLATFORM_LABEL = {
     "ucshare": "\u2601\uFE0F UC Share",
-    "slicedrive": "\U0001F3AC SliceDrive",
+    "slicedrive": "\U0001F3AC Videy",
     "terabox": "\U0001F4E6 TeraBox",
     "subtitle": "\U0001F4DD Subtitle",
 }
@@ -107,7 +107,7 @@ def _b(text: str, **kw) -> dict:
 def menu_keyboard(is_admin: bool) -> list:
     kb = [
         [_b("\u2601\uFE0F UC Share", data="menu:ucshare", style="success"),
-         _b("\U0001F3AC SliceDrive", data="menu:slicedrive", style="primary")],
+         _b("\U0001F3AC Videy", data="menu:slicedrive", style="primary")],
         [_b("\U0001F4E6 TeraBox", data="menu:terabox", style="success"),
          _b("\U0001F4DD Subtitle", data="menu:subtitle", style="primary")],
     ]
@@ -593,7 +593,7 @@ async def handle_callback(client, event):
         db.kv_set(f"input:{chat}", mode, ttl=INPUT_TTL)
         hints = {
             "ucshare": "Kirim link UC Share:",
-            "slicedrive": "Kirim link SliceDrive:",
+            "slicedrive": "Kirim link Videy:",
             "terabox": "Kirim link TeraBox:",
             "subtitle": "Kirim judul subtitle:",
         }
