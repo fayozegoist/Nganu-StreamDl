@@ -26,7 +26,6 @@ from flask import Flask, Response, jsonify, request, send_file
 
 import db
 import security
-import subsrt
 import terabox as tb
 import official
 
@@ -1140,23 +1139,6 @@ def m_player(token: str):
         resp.headers["Content-Disposition"] = f'attachment; filename="{safe}"'
     else:
         resp.headers["Content-Disposition"] = "inline"
-    return resp
-
-
-@app.get("/s/<token>")
-def s_subtitle(token: str):
-    info = db.kv_get(f"srt:{token}")
-    if not info or not info.get("url"):
-        return _err(404, "Link tidak ditemukan atau sudah kedaluwarsa.")
-    try:
-        data, fname = subsrt.fetch_subtitle_srt(info["url"])
-    except Exception as e:
-        return _err(502, str(e)[:200])
-    resp = Response(data, mimetype="application/x-subrip")
-    safe = fname.replace('"', "_")
-    resp.headers["Content-Disposition"] = f'attachment; filename="{safe}"'
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
 

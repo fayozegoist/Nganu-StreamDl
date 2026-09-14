@@ -8,7 +8,6 @@ State disimpan di SQLite (db.py) agar survive restart multi-proses.
 import asyncio
 import os
 import re
-import secrets
 import sys
 import time
 import traceback
@@ -23,6 +22,7 @@ from telethon.errors import UserNotParticipantError
 import app as backend
 import db
 import slicedrive
+import subsrt
 import ucshare
 
 API_ID = int(os.environ.get("API_ID", "") or 0)
@@ -52,7 +52,6 @@ ITEMS_PER_PAGE = 7
 NAME_MAX = 60
 INPUT_TTL = 5 * 60 * 1000
 PAGE_TTL = 10 * 60 * 1000
-SRT_TTL_MS = 3 * 60 * 60 * 1000
 TERA_COOLDOWN_MS = 60 * 1000
 
 ICONS = {"video": "\U0001F3AC", "audio": "\U0001F3B5", "photo": "\U0001F5BC\uFE0F", "file": "\U0001F4C4"}
@@ -313,17 +312,12 @@ def render_media_page(items: list, platform: str, page: int) -> tuple[str, list 
     return text, buttons
 
 
-def _subtitle_link(detail_url: str) -> str:
-    token = secrets.token_urlsafe(12)
-    db.kv_set(f"srt:{token}", {"url": detail_url}, ttl=SRT_TTL_MS)
-    return f"{BASE_URL}/s/{token}"
-
-
 def render_subtitle_page(results: list, platform: str, page: int) -> tuple[str, list | None]:
     n = len(results)
     start = (page - 1) * ITEMS_PER_PAGE
     chunk = results[start:start + ITEMS_PER_PAGE]
     blocks = []
+    rows: list[list[dict]] = []
     for idx, r in enumerate(chunk, start=start + 1):
         title = esc(_stripped_title(r.get("title") or "-"))
         line = f"<b>{idx}.</b> {title}\n"
@@ -331,13 +325,14 @@ def render_subtitle_page(results: list, platform: str, page: int) -> tuple[str, 
         dl_count = m.group(1) if m else "-"
         line += f"\u3000\u3000Total download: <b>{dl_count}</b>\n"
         if r.get("detailUrl"):
-            link = _subtitle_link(r["detailUrl"])
-            line += f"\u3000\u3000<a href=\"{esc(link)}\">Download</a>"
+            rows.append([_b("\u2B07\uFE0F Download", data=f"sub:{idx}", style="success")])
         blocks.append(line)
     body = "\n\n".join(blocks)
     text = f"\u2705 <b>Berhasil ditemukan</b>\n\n\U0001F4CA Total hasil: <b>{n}</b>\n\n{body}"
     pg = pager(platform, page, n)
-    return text, (pg or None)
+    if pg:
+        rows.extend(pg)
+    return text, (rows or None)
 
 
 # ------------------- subtitle scraper (subtitlecat.com) -------------------
@@ -675,6 +670,38 @@ async def handle_callback(client, event):
             text, buttons = render_media_page(items, platform, page)
         await edit_msg(chat, msg_id, text, buttons)
         await answer_cb(event.id)
+        return
+
+    if raw.startswith("sub:"):
+        try:
+            idx = int(raw.split(":", 1)[1])
+        except (TypeError, ValueError, IndexError):
+            await answer_cb(event.id, "Item tidak valid.", alert=True)
+            return
+        data = db.kv_get(f"page:{chat}:subtitle", PAGE_TTL)
+        if not data:
+            await answer_cb(event.id, "Sesi berakhir. Cari ulang dari menu.", alert=True)
+            return
+        items = data["items"]
+        if idx < 1 or idx > len(items):
+            await answer_cb(event.id, "Item tidak valid.", alert=True)
+            return
+        detail = items[idx - 1].get("detailUrl")
+        if not detail:
+            await answer_cb(event.id, "Subtitel tanpa file.", alert=True)
+            return
+        await answer_cb(event.id, "\u23F3 Mengambil subtitle...")
+        try:
+            srt, fname = await asyncio.to_thread(subsrt.fetch_subtitle_srt, detail)
+        except Exception as e:
+            print(f"[BOT] sub fetch error: {e!r}", file=sys.stderr)
+            await send_msg(chat, f"\u274C Gagal ambil subtitle: {esc(str(e))[:200]}")
+            return
+        try:
+            await send_doc(chat, srt, fname, caption=items[idx - 1].get("title") or "")
+        except Exception as e:
+            print(f"[BOT] sub send error: {e!r}", file=sys.stderr)
+            await send_msg(chat, f"\u274C Gagal kirim subtitle: {esc(str(e))[:200]}")
         return
 
 
