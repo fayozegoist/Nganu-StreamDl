@@ -1,5 +1,7 @@
 """Resolver SliceDrive / Videy / Vidmonstr / Vid3y — port dari CF Worker bypass-bot (JS)."""
 
+import base64
+import json
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -147,30 +149,40 @@ def _folder(slug: str) -> list[dict]:
     if not r.ok:
         raise ValueError(f"gagal buka folder vidmonstr: HTTP {r.status_code}")
     html = r.text
-    links = re.findall(r'<a[^>]+href="/d/([a-z0-9]+)"[^>]*>([^<]+)</a>', html, re.I)
-    names = []
+    slugs = []
     seen = set()
-    for slug2, name in links:
-        name = name.strip()
-        if not re.search(r"\.(mp4|mkv|webm|avi|mov)$", name, re.I):
-            continue
-        if slug2 in seen:
-            continue
-        seen.add(slug2)
-        names.append((slug2, name))
-    if not names:
+    for m in re.finditer(r'href="/d/([a-z0-9]+)"', html, re.I):
+        s = m.group(1)
+        if s not in seen:
+            seen.add(s)
+            slugs.append(s)
+    if not slugs:
         raise ValueError("folder vidmonstr tidak berisi file video")
 
     out: list[dict] = []
     lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=4) as ex:
-        def run(entry):
-            item = _file(entry[0], entry[1])
+        def run(entry: tuple[int, str]) -> None:
+            num, s = entry
+            item = _file(s, str(num))
             if item:
                 with lock:
                     out.append(item)
-        list(ex.map(run, names))
+        list(ex.map(run, enumerate(slugs, start=1)))
     return out
+
+
+def _token_title(token: str) -> str | None:
+    try:
+        payload = token.split(".")[0]
+        pad = "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload + pad))
+        rf = data.get("rf")
+        if rf:
+            return str(rf).replace(".mp4", "", 1)
+    except Exception:
+        pass
+    return None
 
 
 def _file(slug: str, name: str | None = None) -> dict | None:
@@ -199,7 +211,8 @@ def _file(slug: str, name: str | None = None) -> dict | None:
                           timeout=10)
         if not r3.ok:
             return None
-        title = (name or slug).replace(".mp4", "", 1)
+        title = _token_title(token.group(1)) or (name or slug)
+        title = title.replace(".mp4", "", 1)
         m = re.search(r"https://mp4-[\w.-]+\.overfetch\.video/[\w-]+", r3.text)
         if m:
             mp4 = m.group(0)
