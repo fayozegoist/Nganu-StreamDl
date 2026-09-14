@@ -1,0 +1,11 @@
+.env
+.env.*
+*.db
+*.session
+session*.txt
+data/
+downloads/
+__pycache__/
+*.pyc
+.git
+Dockerfile

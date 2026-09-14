@@ -5,9 +5,11 @@ Tidak mengekspos CDN upstream (getindevice.com / v4.freeterabox.com) ke klien.
 Semua URL stream/download memakai HMAC sig+exp (8 jam) tanpa membocorkan key.
 """
 
+import html
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -22,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, Response, jsonify, request, send_file
 
+import db
 import security
 import terabox as tb
 import official
@@ -987,6 +990,142 @@ def stream_seg():
         resp.headers["Content-Length"] = length
     resp.headers["Cache-Control"] = "public, max-age=3600"
     resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+MEDIA_TTL_MS = 3 * 3600 * 1000
+
+
+def create_media_token(url: str, stream: str | None = None, fname: str = "video.mp4",
+                       exp: int | None = None, referer: str | None = None) -> str:
+    """Buat token media (UC Share / SliceDrive) untuk /m/{token}."""
+    token = secrets.token_urlsafe(14)
+    db.kv_set(f"dl:{token}", {
+        "url": url,
+        "stream": stream or url,
+        "f": fname,
+        "exp": exp if exp is not None else int(time.time() * 1000) + MEDIA_TTL_MS,
+        "referer": referer,
+    })
+    return token
+
+
+def _media_info(token: str) -> dict | None:
+    info = db.kv_get(f"dl:{token}")
+    if not info:
+        return None
+    exp = info.get("exp")
+    try:
+        if exp and int(time.time() * 1000) > int(exp):
+            db.kv_del(f"dl:{token}")
+            return None
+    except (TypeError, ValueError):
+        pass
+    return info
+
+
+_PLAYER_HTML = """<!doctype html>
+<html lang="id"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; background: #000; color: #fff;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }}
+  video {{ display: block; width: 100%; max-height: 86vh; background: #000; }}
+  .bar {{ display: flex; align-items: center; gap: 12px; padding: 10px 12px; }}
+  .bar .name {{ flex: 1; min-width: 0; font-size: 14px; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .dl {{ padding: 9px 16px; border-radius: 8px; background: rgba(255,255,255,.14);
+    color: #fff; text-decoration: none; font-size: 14px; font-weight: 600; }}
+  .err {{ color: #ffd6d6; padding: 18px; font-size: 14px; line-height: 1.5; }}
+</style>
+</head><body>
+<video id="v" controls playsinline preload="auto" src="{src}"></video>
+<div class="bar">
+  <span class="name" id="name">{title}</span>
+  <a class="dl" href="{dl}">&#8681; Download</a>
+</div>
+<script>
+  var v = document.getElementById('v');
+  var name = document.getElementById('name');
+  v.addEventListener('error', function () {{
+    name.textContent = 'Gagal memuat video. Link mungkin sudah kedaluwarsa atau format tidak didukung. Gunakan tombol Download.';
+  }});
+</script>
+</body></html>
+"""
+
+
+@app.get("/m/<token>")
+def m_player(token: str):
+    info = _media_info(token)
+    if not info:
+        return _err(404, "Link tidak ditemukan atau sudah kedaluwarsa. Buat ulang dari Telegram.")
+    dl = request.args.get("dl") == "1"
+    raw = request.args.get("raw") == "1"
+    if not raw and not dl:
+        fname = html.escape(info.get("f") or "video.mp4")
+        html_page = _PLAYER_HTML.format(title=fname, src=f"/m/{token}?raw=1",
+                                        dl=f"/m/{token}?dl=1")
+        resp = Response(html_page, mimetype="text/html")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+
+    target = info.get("url") if dl else (info.get("stream") or info.get("url"))
+    if not target:
+        return _err(404, "Tidak ada sumber stream/download.")
+
+    headers = {"User-Agent": UA}
+    referer = info.get("referer")
+    if referer:
+        headers["Referer"] = referer
+    rng = request.headers.get("Range")
+    if rng:
+        headers["Range"] = rng
+    try:
+        upstream = urllib.request.urlopen(
+            urllib.request.Request(target, headers=headers), timeout=60)
+    except urllib.error.HTTPError as e:
+        return _err(502, f"CDN menolak (HTTP {e.code}).")
+    except Exception as e:
+        return _err(502, f"CDN gagal: {e}")
+
+    def gen():
+        try:
+            while True:
+                chunk = upstream.read(CHUNK)
+                if not chunk:
+                    break
+                yield chunk
+        except Exception:
+            pass
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    mime = upstream.headers.get("Content-Type") or mime_for(info.get("f") or "video.mp4")
+    if not mime.startswith(("video/", "audio/", "image/")):
+        mime = mime_for(info.get("f") or "video.mp4")
+    resp = Response(gen(), content_type=mime)
+    cl = upstream.headers.get("Content-Length")
+    if cl:
+        resp.headers["Content-Length"] = str(cl)
+    cr = upstream.headers.get("Content-Range")
+    if cr:
+        resp.headers["Content-Range"] = cr
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "no-store"
+    if dl:
+        safe = (info.get("f") or "video.mp4").replace('"', "_")
+        resp.headers["Content-Disposition"] = f'attachment; filename="{safe}"'
+    else:
+        resp.headers["Content-Disposition"] = "inline"
     return resp
 
 

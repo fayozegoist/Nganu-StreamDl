@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Telethon bot — daftar file TeraBox + tombol Stream (web player) & Download (auto unduh).
+"""Telethon bot (MTProto polling) — port fitur penuh CF Worker bypass-bot.
 
-Menjalankan di proses terpisah (python bot.py) bareng gunicorn di container yang sama.
-Tidak mengirim media langsung ke Telegram; semua pengiriman lewat web service (app.py).
+Platform: UC Share, SliceDrive, TeraBox, Subtitle. Tanpa webhook.
+State disimpan di SQLite (db.py) agar survive restart multi-proses.
 """
 
 import asyncio
-import hashlib
 import os
 import re
 import sys
@@ -14,286 +13,608 @@ import time
 import traceback
 import urllib.parse
 
-from telethon import TelegramClient, Button, events
+import requests
+from telethon import Button, TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.errors import UserNotParticipantError
 
 import app as backend
-import security
+import db
+import slicedrive
+import ucshare
 
 API_ID = int(os.environ.get("API_ID", "") or 0)
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_IDS = {x.strip() for x in os.environ.get("OWNER_IDS", "").split(",") if x.strip()}
+OWNER_ID = int(os.environ.get("OWNER_ID") or os.environ.get("OWNER_IDS") or "0")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "") or 0)
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "") or "https://t.me/MediafairyCh"
 
-SESSION_FILE = os.environ.get("TELETHON_SESSION_FILE", "/app/data/session.txt")
-BASE_URL = os.environ.get("BASE_URL", "https://terabox-resolver-production-99be.up.railway.app").rstrip("/")
+
+def _detect_base_url() -> str:
+    b = (os.environ.get("BASE_URL") or "").rstrip("/")
+    if b:
+        return b
+    domain = (os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip()
+    if domain:
+        return f"https://{domain}"
+    return ""
+
+
+BASE_URL = _detect_base_url()
+
+SESS_FILE = os.environ.get("TELETHON_SESSION_FILE", "/app/data/session.txt")
+SESS_STRING = os.environ.get("TELETHON_SESSION", "").strip()
 
 ITEMS_PER_PAGE = 7
 NAME_MAX = 60
-RESOLVE_CACHE_TTL = 10 * 60
+INPUT_TTL = 5 * 60 * 1000
+PAGE_TTL = 10 * 60 * 1000
 
 ICONS = {"video": "\U0001F3AC", "audio": "\U0001F3B5", "photo": "\U0001F5BC\uFE0F", "file": "\U0001F4C4"}
+PLATFORM_LABEL = {
+    "ucshare": "\u2601\uFE0F UC Share",
+    "slicedrive": "\U0001F3AC SliceDrive",
+    "terabox": "\U0001F4E6 TeraBox",
+    "subtitle": "\U0001F4DD Subtitle",
+}
 
 START_TEXT = (
-    "\u26A1 <b>TeraBox Bot</b>\n\n"
-    "Kirim link share TeraBox (<code>https://terabox.com/s/...</code>) dan saya akan berikan "
-    "daftar file beserta tombolnya:\n\n"
-    "\u25B6\uFE0F <b>Stream</b> \u2014 putar langsung di browser (klik, langsung jalan)\n"
-    "\u2B07\uFE0F <b>Download</b> \u2014 unduh otomatis dengan nama file asli\n\n"
-    "Stream & download bebas tanpa limit. Ekstrak link baru: "
-    "<b>1x per 3 menit</b> (admin bebas).\n"
-    "Link tidak kedaluwarsa selama share TeraBox masih aktif.\n\n"
-    "Perintah:\n/help \u2014 bantuan\n/id \u2014 lihat ID kamu"
+    "<b>Selamat datang!</b> \U0001F44B\n\n"
+    "Gunakan bot ini untuk download video dan subtitle.\n\n"
+    "Ketik <b>/menu</b> untuk melihat menu fitur."
 )
-
-EXTRACT_COOLDOWN = 3 * 60
-_extract_last: dict = {}
-
-view_map: dict = {}
-resolve_cache: dict = {}
+JOIN_TEXT = "<b>\u26A0\uFE0F Join channel dulu:</b>"
 
 
-def is_owner(uid) -> bool:
-    if not OWNER_IDS:
-        return True
-    return str(uid) in OWNER_IDS
-
-
-def _extract_cooldown_left(uid) -> int:
-    if is_owner(uid):
-        return 0
-    last = _extract_last.get(uid)
-    if not last:
-        return 0
-    return max(0, int(EXTRACT_COOLDOWN - (time.time() - last)))
-
-
-def extract_share_url(text: str) -> str | None:
-    for m in re.finditer(r"https?://[^\s<>\"']+", text or ""):
-        if backend.is_valid_terabox(m.group(0)):
-            return m.group(0)
-    return None
-
-
-def _resolve_cached(url: str) -> dict:
-    now = time.time()
-    hit = resolve_cache.get(url)
-    if hit and now - hit[1] < RESOLVE_CACHE_TTL:
-        return hit[0]
-    data = backend.resolve_terabox(url)
-    resolve_cache[url] = (data, now)
-    return data
-
-
-def build_pending_files(data: dict) -> list[dict]:
-    out = []
-    for f in data["files"]:
-        out.append({
-            "filename": f.get("name") or f"TeraBox_{f['index'] or 0}.{f.get('format', 'mp4')}",
-            "size": f.get("quality", "N/A"),
-            "kind": f.get("kind", "file"),
-            "url": data["url"],
-            "index": f.get("index", 0),
-        })
-    return out
-
-
-def file_links(item: dict) -> tuple[str, str] | None:
-    kind = item["kind"]
-    if not security.has_keys():
-        q = urllib.parse.quote(item["url"], safe="")
-        dl = f"{BASE_URL}/dl?url={q}&n={item['index']}"
-        stream = f"{BASE_URL}/play?url={q}&n={item['index']}" if kind in ("video", "audio") else None
-        return (stream, dl)
-    q = urllib.parse.quote(item["url"], safe="")
-    exp = security.exp_later()
-    dl = f"{BASE_URL}/dl?url={q}&n={item['index']}&exp={exp}&sig={security.sign(item['url'], item['index'], exp)}"
-    stream = None
-    if kind in ("video", "audio"):
-        stream = f"{BASE_URL}/play?url={q}&n={item['index']}&exp={exp}&sig={security.sign(item['url'], item['index'], exp)}"
-    return (stream, dl)
-
-
-def _esc(s: str) -> str:
-    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def esc(s) -> str:
+    return (str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace('"', "&quot;").replace("'", "&#39;"))
 
 
-def render_page(items: list[dict], page: int) -> str:
-    start = (page - 1) * ITEMS_PER_PAGE
-    end = start + ITEMS_PER_PAGE
-    blocks = []
-    for i, item in enumerate(items[start:end], start=start + 1):
-        name = item["filename"]
-        if len(name) > NAME_MAX:
-            name = name[:NAME_MAX] + "\u2026"
-        stream, dl = file_links(item)
-        line = (
-            f"<b>{i}.</b> {ICONS.get(item['kind'], '\U0001F4C4')} Title  : <b>{_esc(name)}</b>\n"
-            f"\u3000\u3000\U0001F4BE Size  : {_esc(item['size'])}\n"
-        )
-        if stream:
-            line += f"\u3000\u3000<a href=\"{_esc(stream)}\">\u25B6\uFE0F Stream</a>\n"
-        if dl:
-            line += f"\u3000\u3000<a href=\"{_esc(dl)}\">\u2B07\uFE0F Download</a>"
-        blocks.append(line)
-    body = "\n\n".join(blocks)
-    return f"\u2705 <b>Berhasil di ekstrak</b>\n\n\U0001F4CA Total file: <b>{len(items)}</b>\n\n{body}"
+def fmt_size(size) -> str:
+    if size is None or size == 0:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    v = float(size)
+    i = 0
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024
+        i += 1
+    return f"{v:.0f} {units[i]}"
 
 
-def page_buttons(items: list[dict], page: int, view_token: str) -> list[list] | None:
-    pages = max(1, -(-len(items) // ITEMS_PER_PAGE))
-    if pages <= 1:
-        return None
-    nav: list = []
+def _stripped_title(title: str, maxlen: int = NAME_MAX) -> str:
+    title = re.sub(r"\s+", " ", str(title or "").strip())
+    return title if len(title) <= maxlen else title[:maxlen] + "\u2026"
+
+
+def menu_keyboard(is_admin: bool) -> list:
+    kb = [
+        [Button.inline("\u2601\uFE0F UC Share", b"menu:ucshare"),
+         Button.inline("\U0001F3AC SliceDrive", b"menu:slicedrive")],
+        [Button.inline("\U0001F4E6 TeraBox", b"menu:terabox"),
+         Button.inline("\U0001F4DD Subtitle", b"menu:subtitle")],
+    ]
+    if is_admin:
+        kb.append([Button.inline("\u2699\uFE0F Admin", b"menu:admin")])
+    return kb
+
+
+def join_keyboard() -> list:
+    return [
+        [Button.url("\U0001F517 Join Channel", CHANNEL_LINK),
+         Button.inline("\U0001F6E1\uFE0F Verifikasi", b"menu:verify")],
+    ]
+
+
+def cancel_keyboard() -> list:
+    return [[Button.inline("\u274C Batal", b"cancel")]]
+
+
+def pager(platform: str, page: int, total: int) -> list:
+    pages = max(1, -(-total // ITEMS_PER_PAGE))
+    row = []
     if page > 1:
-        nav.append(Button.inline("\u2B05\uFE0F Kembali", data=f"p:{view_token}:{page - 1}".encode()))
-    nav.insert(len(nav) // 2, Button.inline(f"<{page}/{pages}>", data=f"p:{view_token}:{page}".encode()))
+        row.append(Button.inline("\u2B05 Prev", f"page:{platform}:{page - 1}".encode()))
+    row.append(Button.inline(f"{page}/{pages}", b"noop"))
     if page < pages:
-        nav.append(Button.inline("Lanjut \u27A1\uFE0F", data=f"p:{view_token}:{page + 1}".encode()))
-    return [nav]
+        row.append(Button.inline("Next \u27A1", f"page:{platform}:{page + 1}".encode()))
+    return [row] if len(row) > 1 else []
 
 
-def _new_view_token() -> str:
-    slug = hashlib.sha1(os.urandom(16)).hexdigest()[:10]
-    view_map[slug] = None
-    return slug
-
-
-def _load_session() -> str | None:
-    s = os.environ.get("TELETHON_SESSION", "").strip()
-    if s:
-        return s
+async def is_member(client, user_id: int) -> bool:
+    if not CHANNEL_ID:
+        return True
     try:
-        if os.path.exists(SESSION_FILE):
-            s = open(SESSION_FILE, encoding="utf-8").read().strip()
-            if s:
-                return s
+        await client(GetParticipantRequest(CHANNEL_ID, user_id))
+        return True
+    except UserNotParticipantError:
+        return False
     except Exception:
-        pass
+        return True
+
+
+def _referer_for(platform: str, media_url: str) -> str | None:
+    try:
+        host = urllib.parse.urlparse(media_url or "").hostname or ""
+    except Exception:
+        return None
+    if "aliyuncs.com" in host:
+        return "https://uc-share.com/"
+    if "overfetch." in host or "vidmonstr.com" in host:
+        return "https://vidmonstr.com/"
     return None
 
 
-def _save_session(sess: str) -> None:
+def make_media_token(platform: str, item: dict) -> tuple[str, str]:
+    """Buat token dl:{token} untuk stream/download. Return (stream_url, dl_url)."""
+    raw = item.get("url") or ""
+    stream = item.get("stream_url") or raw
+    token = backend.create_media_token(
+        raw, stream,
+        fname=(item.get("title") or "video").replace("/", "_")[:80] + ".mp4",
+        referer=_referer_for(platform, stream or raw),
+    )
+    return f"{BASE_URL}/m/{token}", f"{BASE_URL}/m/{token}?dl=1"
+
+
+def render_media_page(items: list, platform: str, page: int) -> tuple[str, list | None]:
+    n = len(items)
+    start = (page - 1) * ITEMS_PER_PAGE
+    chunk = items[start:start + ITEMS_PER_PAGE]
+    label = PLATFORM_LABEL.get(platform, platform)
+    text = f"<b>\u2728 Berhasil di ekstrak</b>\n\n\U0001F5C2\uFE0F Total: <b>{n if n > 1 else '1 file'} ({label})</b>\n"
+    buttons = []
+    for idx, it in enumerate(chunk, start=start + 1):
+        title = esc(_stripped_title(it.get("title") or "(tanpa judul)"))
+        text += f"\n{idx}. \U0001F3AC <b>{title}</b>\n"
+        size = it.get("size")
+        if size is not None:
+            if isinstance(size, (int, float)):
+                text += f"\u3000\u3000\U0001F4BD {esc(fmt_size(size))}\n"
+            else:
+                text += f"\u3000\u3000\U0001F4BD {esc(size)}\n"
+        stream = it.get("stream")
+        download = it.get("download")
+        row = []
+        if stream and download:
+            row = [Button.url(f"#{idx} Stream", stream), Button.url(f"#{idx} Download", download)]
+        elif download:
+            row = [Button.url(f"#{idx} Download", download)]
+        elif stream:
+            row = [Button.url(f"#{idx} Stream", stream)]
+        if row:
+            buttons.append(row)
+    pg = pager(platform, page, n)
+    if pg:
+        buttons.extend(pg)
+    return text, (buttons or None)
+
+
+def render_subtitle_page(results: list, platform: str, page: int) -> tuple[str, list | None]:
+    n = len(results)
+    start = (page - 1) * ITEMS_PER_PAGE
+    chunk = results[start:start + ITEMS_PER_PAGE]
+    text = f"<b>\u2728 Berhasil ditemukan</b>\n\n\U0001F5C2\uFE0F Total hasil: <b>{n}</b>\n"
+    buttons = []
+    for idx, r in enumerate(chunk, start=start + 1):
+        title = esc(_stripped_title(r.get("title") or "-"))
+        text += f"\n{idx}. \U0001F4DC <b>{title}</b>\n"
+        note = r.get("note") or ""
+        if note:
+            text += f"\u3000\u3000\U0001F310 {esc(note)}\n"
+        if r.get("size"):
+            text += f"\u3000\u3000\U0001F4BD {esc(r['size'])}\n"
+        if r.get("detailUrl"):
+            text += f"\u3000\u3000\U0001F4E5 Ambil: {r['detailUrl']}\n"
+    pg = pager(platform, page, n)
+    if pg:
+        buttons.extend(pg)
+    return text, (buttons or None)
+
+
+# ------------------- subtitle scraper (subtitlecat.com) -------------------
+
+_SUB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+
+
+def _strip_html(s: str = "") -> str:
+    s = re.sub(r"<[^>]+>", " ", str(s))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _unescape(s: str = "") -> str:
+    s = (str(s).replace("&amp;", "&").replace("&quot;", '"')
+         .replace("&#39;", "'").replace("&#x27;", "'")
+         .replace("&lt;", "<").replace("&gt;", ">"))
+    return re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), s)
+
+
+def search_subtitle(q: str) -> list[dict]:
+    r = requests.get(
+        f"https://www.subtitlecat.com/index.php?search={urllib.parse.quote(q)}",
+        headers={"User-Agent": _SUB_UA,
+                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+        timeout=20,
+    )
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    html = r.text
+    table = (re.search(r'<table[^>]*class="[^"]*\bsub-table\b[^"]*"[\s\S]*?</table>', html, re.I)
+             or ["", html])[0]
+    results = []
+    for row in re.findall(r"<tr\b[^>]*>([\s\S]*?)</tr>", table, re.I):
+        tds = re.findall(r"<td\b[^>]*>([\s\S]*?)</td>", row, re.I)
+        if not tds:
+            continue
+        a = re.search(r'<a\b[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>', tds[0], re.I)
+        if not a:
+            continue
+        title = _unescape(_strip_html(a.group(2)))
+        if not title:
+            continue
+        detail = a.group(1)
+        rest = re.sub(r"<a\b[\s\S]*?</a>", "", tds[0])
+        note = re.sub(r"^\(|\)$", "", _unescape(_strip_html(rest))).strip()
+        size = _unescape(_strip_html((re.search(r"sub-table__metric-value[^>]*>([\s\S]*?)<", tds[2])
+                                       or [None, tds[2]])[1])) if len(tds) > 2 else ""
+        downloads = _unescape(_strip_html(tds[3])) if len(tds) > 3 else ""
+        results.append({
+            "title": title,
+            "note": note,
+            "detailUrl": urllib.parse.urljoin("https://www.subtitlecat.com", detail),
+            "size": size,
+            "downloads": downloads,
+        })
+    return results
+
+
+# ------------------- admin helpers -------------------
+
+def admin_panel(section: str) -> dict:
+    if section in ("stats", "/stats"):
+        st = db.get_stats()
+        text = (f"<b>\U0001F4CA Statistik</b>\n\n"
+                f"\U0001F464 Total user: <b>{st['total_users']}</b>\n"
+                f"\U0001F4E5 Request hari ini: <b>{st['today_requests']}</b>\n"
+                f"\U0001F4E5 Request 7 hari: <b>{st['week_requests']}</b>\n"
+                f"\u2705 Success rate: <b>{st['success_rate']}%</b>")
+    elif section in ("users", "/users"):
+        users = db.list_users(30)
+        if users:
+            lines = []
+            for u in users:
+                name = u.get("first_name") or "-"
+                uname = u.get("username") or "no-username"
+                lines.append(f"\U0001F464 {esc(name)} (@{esc(uname)}) \u2014 {u.get('request_count')} req")
+            text = f"<b>\U0001F4CB User aktif (top 30)</b>\n\n" + "\n".join(lines)
+        else:
+            text = "Belum ada user."
+    elif section == "menu":
+        text = ("<b>\U0001F44B Admin Panel</b>\n\n"
+                "/stats \u2014 Statistik\n"
+                "/users \u2014 Daftar user\n"
+                "/broadcast &lt;text&gt; \u2014 Kirim pesan ke semua user")
+    else:
+        text = "<b>\U0001F44B Admin Panel</b>\n\n/stats \u2014 Statistik\n/users \u2014 Daftar user\n/broadcast &lt;text&gt; \u2014 Pesan massal"
+    return {"text": text, "buttons": None}
+
+
+def fmt_last_active(ms: int) -> str:
+    if not ms:
+        return "-"
+    t = time.localtime(int(ms) / 1000 + 7 * 3600)
+    return time.strftime("%d/%m %H:%M", t)
+
+
+# ------------------- link processing -------------------
+
+def _platform_items(platform: str, payload: str, base_url: str):
+    """Resolve link sesuai platform; return list item dict {title,size,stream,download}."""
+    if platform == "ucshare":
+        data = ucshare.resolve(payload)
+        items = []
+        for m in data.get("medias", []):
+            stream, dl = make_media_token("ucshare", m)
+            items.append({"title": m.get("title") or "(tanpa judul)",
+                          "size": m.get("size"), "stream": stream if m.get("url") else None,
+                          "download": dl if m.get("url") else None})
+        return items, data.get("url", payload)
+    if platform == "slicedrive":
+        data = slicedrive.resolve(payload)
+        items = []
+        for m in data.get("medias", []):
+            stream, dl = make_media_token("slicedrive", m)
+            items.append({"title": m.get("title") or "(tanpa judul)",
+                          "size": m.get("size"), "stream": stream if m.get("url") else None,
+                          "download": dl if m.get("url") else None})
+        return items, data.get("url", payload)
+    if platform == "terabox":
+        data = backend.resolve_terabox(payload)
+        items = []
+        for f in data.get("files", []):
+            p = backend._file_payload(payload, f.get("index", 1), base_url)
+            items.append({"title": p.get("name") or f"TeraBox_{f.get('index')}",
+                          "size": p.get("size_label"), "stream": p.get("stream"),
+                          "download": p.get("download")})
+        return items, data.get("url", payload)
+    raise ValueError("Platform tidak valid")
+
+
+def process_platform(platform: str, payload: str) -> dict:
+    """Return {"items":[...], "src": str, "platform": str}."""
+    items, src = _platform_items(platform, payload, BASE_URL)
+    if not items:
+        raise ValueError("Tidak ada file ditemukan.")
+    return {"items": items, "src": src, "platform": platform}
+
+
+async def handle_command(client, event, text: str):
+    chat = event.chat_id
+    uid = event.sender_id or 0
+    lower = text.split()[0].lower()
+
+    if lower == "/cancel":
+        db.kv_del(f"input:{chat}")
+        waiting = db.kv_get(f"res:{chat}")
+        if waiting is not None:
+            db.kv_del(f"res:{chat}")
+            try:
+                await client.delete_messages(chat, [waiting])
+            except Exception:
+                pass
+        await event.respond("\u2705 Dibatalkan.")
+        return
+
+    if lower == "/start":
+        db.kv_del(f"input:{chat}")
+        db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
+        if await is_member(client, uid):
+            await event.respond(START_TEXT + "\n\nKetik <b>/menu</b> untuk melihat menu fitur.",
+                                parse_mode="html")
+        else:
+            await event.respond(JOIN_TEXT, parse_mode="html", buttons=join_keyboard())
+        return
+
+    if lower == "/menu":
+        db.kv_del(f"input:{chat}")
+        if not await is_member(client, uid):
+            await event.respond(JOIN_TEXT, parse_mode="html", buttons=join_keyboard())
+            return
+        db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
+        await event.respond("<b>\U0001F4CB Menu</b>\n\nPilih fitur:", parse_mode="html",
+                            buttons=menu_keyboard(uid == OWNER_ID))
+        return
+
+    if lower in ("/admin", "/stats", "/users", "/broadcast"):
+        if uid != OWNER_ID:
+            await event.respond("\u274C Hanya owner.")
+            return
+        db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
+        if lower == "/broadcast":
+            msg = text.split(" ", 1)[1].strip() if " " in text else ""
+            await event.respond(admin_panel("usage"))
+            if msg:
+                sent = 0
+                for target in db.all_user_ids():
+                    try:
+                        await client.send_message(target, f"\U0001F4E2 <b>Broadcast</b>\n\n{esc(msg)}",
+                                                  parse_mode="html")
+                        sent += 1
+                    except Exception:
+                        continue
+                await event.respond(f"\u2705 Broadcast terkirim ke {sent} user.")
+            return
+        await event.respond(admin_panel(lower), parse_mode="html")
+        return
+
+    if lower == "/help":
+        await event.respond(START_TEXT, parse_mode="html")
+        return
+
+    if lower == "/id":
+        await event.respond(f"ID: <code>{uid}</code>", parse_mode="html")
+        return
+
+    # mode aktif? proses sebagai link
+    mode = db.kv_get(f"input:{chat}", INPUT_TTL)
+    if mode:
+        db.kv_del(f"input:{chat}")
+        if not await is_member(client, uid):
+            await event.respond(JOIN_TEXT, parse_mode="html", buttons=join_keyboard())
+            return
+        db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
+        await process_and_reply(event, mode, text)
+        return
+
+    await event.respond("Perintah tidak dikenal. Gunakan /menu untuk melihat fitur.")
+
+
+async def process_and_reply(event, platform: str, payload: str):
+    chat = event.chat_id
+    txt = f"\u23F3 Processing..."
+    db.log_request(event.sender_id or 0, platform, platform, payload, "ok")
+    processing = await event.respond(txt, buttons=None)
     try:
-        os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
-        with open(SESSION_FILE, "w", encoding="utf-8") as fh:
-            fh.write(sess)
+        if platform == "subtitle":
+            results = await asyncio.to_thread(search_subtitle, payload)
+            if not results:
+                raise ValueError("Subtitle tidak ditemukan.")
+            key = f"page:{chat}:subtitle"
+            db.kv_set(key, {"items": results}, ttl=PAGE_TTL)
+            text, buttons = render_subtitle_page(results, "subtitle", 1)
+        else:
+            data = await asyncio.to_thread(process_platform, platform, payload)
+            items = data["items"]
+            key = f"page:{chat}:{platform}"
+            db.kv_set(key, {"items": items}, ttl=PAGE_TTL)
+            text, buttons = render_media_page(items, platform, 1)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        await processing.edit(f"\u274C {esc(str(e)[:300])}", parse_mode="html")
+        db.log_request(event.sender_id or 0, platform, platform, payload, "error")
+        return
+    try:
+        await processing.edit(text, parse_mode="html", buttons=buttons)
+    except Exception:
+        pass
+
+
+# ------------------- handlers -------------------
+
+async def handle_callback(client, event):
+    raw = (event.data or b"").decode("utf-8", "replace")
+    chat = event.chat_id
+    uid = event.sender_id or 0
+    msg_id = event.message_id
+
+    if not raw:
+        await event.answer()
+        return
+    if raw == "noop":
+        await event.answer()
+        return
+    if raw == "cancel":
+        db.kv_del(f"input:{chat}")
+        await event.answer("\u274C Dibatalkan")
+        buttons = menu_keyboard(uid == OWNER_ID)
+        await event.edit("<b>\U0001F4CB Menu</b>\n\nPilih fitur:", buttons=buttons, parse_mode="html")
+        return
+
+    if raw.startswith("menu:"):
+        mode = raw[5:]
+        if mode == "verify":
+            await event.answer("\u23F3 Memeriksa keanggotaan...")
+            if await is_member(client, uid):
+                await event.edit("<b>\u2705 Verifikasi berhasil!</b>\n\nAnda sudah join channel. Silakan pilih fitur:",
+                                 buttons=menu_keyboard(uid == OWNER_ID), parse_mode="html")
+            else:
+                await event.edit("<b>\u274C Anda belum join channel!</b>\n\nSilakan join dulu, lalu klik Verifikasi:",
+                                 buttons=join_keyboard(), parse_mode="html")
+            return
+        if mode == "admin":
+            if uid != OWNER_ID:
+                await event.answer("Akses ditolak", alert=True)
+                return
+            res = admin_panel("menu")
+            await event.edit(res["text"], parse_mode="html")
+            await event.answer()
+            return
+        if mode not in ("ucshare", "slicedrive", "terabox", "subtitle"):
+            await event.answer("Mode tidak valid", alert=True)
+            return
+        db.kv_set(f"input:{chat}", mode, ttl=INPUT_TTL)
+        hints = {
+            "ucshare": "Kirim link UC Share:",
+            "slicedrive": "Kirim link SliceDrive:",
+            "terabox": "Kirim link TeraBox:",
+            "subtitle": "Kirim judul subtitle:",
+        }
+        await event.answer()
+        label = PLATFORM_LABEL[mode]
+        await event.edit(f"\U0001F9ED <b>{label}</b>\n\n{hints[mode]}\n\n(Jika ingin mengganti mode, ketik /menu)",
+                         buttons=cancel_keyboard(), parse_mode="html")
+        return
+
+    if raw.startswith("page:"):
+        parts = raw.split(":")
+        platform = parts[1]
+        page_raw = parts[2] if len(parts) > 2 else "1"
+        page = int(page_raw) if page_raw.isdigit() else 1
+        data = db.kv_get(f"page:{chat}:{platform}", PAGE_TTL)
+        if not data:
+            await event.answer("Sesi berakhir. Kirim ulang dari menu.", alert=True)
+            return
+        items = data["items"]
+        pages = max(1, -(-len(items) // ITEMS_PER_PAGE))
+        if page < 1 or page > pages:
+            await event.answer("Halaman tidak valid.", alert=True)
+            return
+        if platform == "subtitle":
+            text, buttons = render_subtitle_page(items, platform, page)
+        else:
+            text, buttons = render_media_page(items, platform, page)
+        await event.edit(text, buttons=buttons, parse_mode="html")
+        await event.answer()
+        return
+
+
+def _load_session() -> StringSession | None:
+    if SESS_STRING:
+        return StringSession(SESS_STRING)
+    if os.path.exists(SESS_FILE):
+        try:
+            return StringSession(open(SESS_FILE, encoding="utf-8").read().strip())
+        except Exception:
+            pass
+    return None
+
+
+def _save_session(client) -> None:
+    try:
+        s = client.session.save()
+        if s:
+            os.makedirs(os.path.dirname(SESS_FILE), exist_ok=True)
+            with open(SESS_FILE, "w", encoding="utf-8") as fh:
+                fh.write(s)
     except Exception as e:
         print(f"[BOT] Gagal simpan session: {e}", file=sys.stderr)
 
 
-async def run_bot() -> None:
-    client = TelegramClient(
-        StringSession(_load_session()), API_ID, API_HASH,
-        connection_retries=10,
-        flood_sleep_threshold=60,
-    )
+async def main() -> None:
+    if not (API_ID and API_HASH and BOT_TOKEN):
+        print("[BOT] API_ID/API_HASH/BOT_TOKEN belum diisi. Bot dimatikan.", file=sys.stderr)
+        await asyncio.Event().wait()
+        return
+    if not BASE_URL:
+        print("[BOT] BASE_URL belum diisi.", file=sys.stderr)
+
+    client = TelegramClient(_load_session() or "bot_session", API_ID, API_HASH,
+                            connection_retries=10, flood_sleep_threshold=60)
 
     @client.on(events.NewMessage)
     async def on_message(event):
         text = (event.raw_text or "").strip()
         if not text:
             return
-
-        peer = event.chat_id if hasattr(event, "chat_id") else event.sender_id
-
-        if text.startswith("/start"):
-            payload = text.split()[1] if len(text.split()) > 1 else None
-            if payload and payload.startswith("dl_"):
-                await event.reply(
-                    "\u26A0\uFE0F Link unduh lama sudah tidak berlaku. Kirim ulang link TeraBox-nya."
-                )
-            else:
-                await event.reply(START_TEXT, parse_mode="html")
-            return
-        if text.startswith("/help"):
-            await event.reply(START_TEXT, parse_mode="html")
-            return
-        if text.startswith("/id"):
-            await event.reply(f"ID: <code>{event.sender_id}</code>", parse_mode="html")
-            return
-
-        url = extract_share_url(text)
-        if not url:
-            return
-
-        # Limit ekstrak: non-admin 1x per 3 menit (dicatat saat permintaan, anti-spam).
-        left = _extract_cooldown_left(event.sender_id)
-        if left > 0:
-            mm, ss = divmod(left, 60)
-            sisa = f"{mm} menit {ss} detik" if mm else f"{ss} detik"
-            await event.reply(
-                f"\u23F3 Kamu sudah ekstrak link baru-baru ini. Coba lagi dalam {sisa}."
-            )
-            return
-        if not is_owner(event.sender_id):
-            _extract_last[event.sender_id] = time.time()
-
-        wait = await event.reply("\u23F3 Me-resolve link TeraBox\u2026")
         try:
-            data = await asyncio.to_thread(_resolve_cached, url)
+            await handle_command(client, event, text)
         except Exception as e:
-            await wait.edit(f"\u274C Gagal resolve link: {str(e)[:300]}")
-            return
-
-        items = build_pending_files(data)
-        view_token = _new_view_token()
-        view_map[view_token] = items
-        await wait.edit(render_page(items, 1), parse_mode="html", buttons=page_buttons(items, 1, view_token))
+            print(f"[BOT] on_message error: {e!r}", file=sys.stderr)
+            traceback.print_exc()
+            try:
+                await event.respond(f"\u274C {esc(str(e))[:200]}")
+            except Exception:
+                pass
 
     @client.on(events.CallbackQuery)
     async def on_callback(event):
         try:
-            raw = bytes(event.data or b"").decode("utf-8", "replace")
-        except Exception:
-            raw = ""
-        if not raw.startswith("p:"):
-            await event.answer(alert=True, message="\u26A0\uFE0F Tombol tidak dikenal.")
-            return
-        _, view_token, page_raw = raw.split(":", 2)
-        items = view_map.get(view_token)
-        if items is None:
-            await event.answer(alert=True, message="\u26A0\uFE0F Sesi kedaluwarsa, kirim ulang link-nya.")
-            return
-        if not page_raw.isdigit():
-            return
-        page = int(page_raw)
-        pages_max = max(1, -(-len(items) // ITEMS_PER_PAGE))
-        if page < 1 or page > pages_max:
-            await event.answer(alert=True, message="\u26A0\uFE0F Halaman tidak valid.")
-            return
-        await event.edit(render_page(items, page), parse_mode="html", buttons=page_buttons(items, page, view_token))
-        await event.answer(message="")
+            await handle_callback(client, event)
+        except Exception as e:
+            print(f"[BOT] on_callback error: {e!r}", file=sys.stderr)
+            traceback.print_exc()
+            try:
+                await event.answer("Terjadi kesalahan.", alert=True)
+            except Exception:
+                pass
 
-    await client.start(bot_token=BOT_TOKEN)
-    me = await client.get_me()
-    saved = client.session.save()
-    if saved and not _load_session():
-        _save_session(saved)
-    print(f"[BOT] Telegram bot aktif (MTProto) sebagai @{me.username} (id: {me.id})", flush=True)
-    await client.run_until_disconnected()
-
-
-async def keep_alive() -> None:
-    await asyncio.Event().wait()
-
-
-async def main() -> None:
-    if not (API_ID and API_HASH and BOT_TOKEN):
-        print(
-            "[BOT] API_ID/API_HASH/BOT_TOKEN belum diisi. Bot dimatikan, cek variabel Railway.",
-            file=sys.stderr,
-            flush=True,
-        )
-        await keep_alive()
-        return
     try:
-        await run_bot()
+        await client.start(bot_token=BOT_TOKEN)
+        me = await client.get_me()
+        _save_session(client)
+        print(f"[BOT] Telegram bot aktif (MTProto) sebagai @{me.username} (id: {me.id})", flush=True)
     except Exception as e:
-        print(f"[BOT] FATAL: {e!r}", file=sys.stderr, flush=True)
+        print(f"[BOT] start gagal: {e!r}", file=sys.stderr)
         traceback.print_exc()
-        await keep_alive()
+        await asyncio.Event().wait()
+        return
+
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
