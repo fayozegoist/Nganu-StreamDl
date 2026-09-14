@@ -14,7 +14,7 @@ import traceback
 import urllib.parse
 
 import requests
-from telethon import Button, TelegramClient, events
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.errors import UserNotParticipantError
@@ -90,38 +90,126 @@ def _stripped_title(title: str, maxlen: int = NAME_MAX) -> str:
     return title if len(title) <= maxlen else title[:maxlen] + "\u2026"
 
 
+_STYLES = {"primary", "success", "danger"}
+
+
+def _b(text: str, **kw) -> dict:
+    b = {"text": text}
+    if kw.get("url"):
+        b["url"] = kw["url"]
+    else:
+        b["callback_data"] = kw.get("data") or "noop"
+    if kw.get("style") in _STYLES:
+        b["style"] = kw["style"]
+    return b
+
+
 def menu_keyboard(is_admin: bool) -> list:
     kb = [
-        [Button.inline("\u2601\uFE0F UC Share", b"menu:ucshare"),
-         Button.inline("\U0001F3AC SliceDrive", b"menu:slicedrive")],
-        [Button.inline("\U0001F4E6 TeraBox", b"menu:terabox"),
-         Button.inline("\U0001F4DD Subtitle", b"menu:subtitle")],
+        [_b("\u2601\uFE0F UC Share", data="menu:ucshare", style="success"),
+         _b("\U0001F3AC SliceDrive", data="menu:slicedrive", style="primary")],
+        [_b("\U0001F4E6 TeraBox", data="menu:terabox", style="success"),
+         _b("\U0001F4DD Subtitle", data="menu:subtitle", style="primary")],
     ]
     if is_admin:
-        kb.append([Button.inline("\u2699\uFE0F Admin", b"menu:admin")])
+        kb.append([_b("\u2699\uFE0F Admin", data="menu:admin", style="danger")])
     return kb
 
 
 def join_keyboard() -> list:
     return [
-        [Button.url("\U0001F517 Join Channel", CHANNEL_LINK),
-         Button.inline("\U0001F6E1\uFE0F Verifikasi", b"menu:verify")],
+        [_b("\U0001F517 Join Channel", url=CHANNEL_LINK, style="primary"),
+         _b("\U0001F6E1\uFE0F Verifikasi", data="menu:verify", style="success")],
     ]
 
 
 def cancel_keyboard() -> list:
-    return [[Button.inline("\u274C Batal", b"cancel")]]
+    return [[_b("\u274C Batal", data="cancel", style="danger")]]
 
 
 def pager(platform: str, page: int, total: int) -> list:
     pages = max(1, -(-total // ITEMS_PER_PAGE))
     row = []
     if page > 1:
-        row.append(Button.inline("\u2B05 Prev", f"page:{platform}:{page - 1}".encode()))
-    row.append(Button.inline(f"{page}/{pages}", b"noop"))
+        row.append(_b("\u2B05 Prev", data=f"page:{platform}:{page - 1}", style="primary"))
+    row.append(_b(f"{page}/{pages}", data="noop"))
     if page < pages:
-        row.append(Button.inline("Next \u27A1", f"page:{platform}:{page + 1}".encode()))
+        row.append(_b("Next \u27A1", data=f"page:{platform}:{page + 1}", style="success"))
     return [row] if len(row) > 1 else []
+
+
+# ------------------- Telegram HTTP (Bot API) transport -------------------
+# Kirim/edit pesan via HTTP Bot API agar InlineKeyboardButton.style
+# (primary=blue, success=green, danger=red) dipakai — MTProto/Telethon
+# tidak mendukung field style. Update tetap dibaca via Telethon.
+
+TG_URL = "https://api.telegram.org"
+
+
+def _tg(method: str, payload: dict) -> dict:
+    try:
+        r = requests.post(f"{TG_URL}/bot{BOT_TOKEN}/{method}", json=payload, timeout=30)
+    except requests.RequestException as e:
+        raise RuntimeError(f"[TG] {method} gagal: {e}") from e
+    try:
+        j = r.json()
+    except ValueError as e:
+        raise RuntimeError(f"[TG] {method}: respons bukan JSON ({r.status_code})") from e
+    if not j.get("ok"):
+        raise RuntimeError(f"[TG] {method}: {(j.get('description') or j.get('error_code') or 'error')}")
+    return j["result"]
+
+
+def _mk(text: str, buttons, parse_mode: str = "html", link_preview: bool = False) -> dict:
+    payload: dict = {"text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if not link_preview:
+        payload["disable_web_page_preview"] = True
+    if buttons is not None:
+        rows = []
+        for row in buttons:
+            rr = []
+            for b in row:
+                o = {"text": b["text"]}
+                if b.get("url"):
+                    o["url"] = b["url"]
+                else:
+                    o["callback_data"] = b.get("callback_data") or b.get("data") or "noop"
+                if b.get("style") in _STYLES:
+                    o["style"] = b["style"]
+                rr.append(o)
+            rows.append(rr)
+        payload["reply_markup"] = {"inline_keyboard": rows}
+    return payload
+
+
+async def send_msg(chat_id: int, text: str, buttons=None, parse_mode: str = "html",
+                   link_preview: bool = False) -> dict:
+    payload = _mk(text, buttons, parse_mode, link_preview)
+    payload["chat_id"] = chat_id
+    return await asyncio.to_thread(_tg, "sendMessage", payload)
+
+
+async def edit_msg(chat_id: int, message_id: int, text: str, buttons=None,
+                   parse_mode: str = "html") -> None:
+    payload = _mk(text, buttons, parse_mode, link_preview=True)
+    payload["chat_id"] = chat_id
+    payload["message_id"] = message_id
+    await asyncio.to_thread(_tg, "editMessageText", payload)
+
+
+async def del_msg(chat_id: int, message_id: int) -> None:
+    await asyncio.to_thread(_tg, "deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+
+async def answer_cb(query_id: int, text: str = None, alert: bool = False) -> None:
+    p = {"callback_query_id": query_id}
+    if text:
+        p["text"] = text
+    if alert:
+        p["show_alert"] = True
+    await asyncio.to_thread(_tg, "answerCallbackQuery", p)
 
 
 async def is_member(client, user_id: int) -> bool:
@@ -164,56 +252,49 @@ def render_media_page(items: list, platform: str, page: int) -> tuple[str, list 
     n = len(items)
     start = (page - 1) * ITEMS_PER_PAGE
     chunk = items[start:start + ITEMS_PER_PAGE]
-    label = PLATFORM_LABEL.get(platform, platform)
-    text = f"<b>\u2728 Berhasil di ekstrak</b>\n\n\U0001F5C2\uFE0F Total: <b>{n if n > 1 else '1 file'} ({label})</b>\n"
-    buttons = []
+    blocks = []
     for idx, it in enumerate(chunk, start=start + 1):
         title = esc(_stripped_title(it.get("title") or "(tanpa judul)"))
-        text += f"\n{idx}. \U0001F3AC <b>{title}</b>\n"
+        line = f"<b>{idx}.</b> \U0001F3AC Title  : <b>{title}</b>\n"
         size = it.get("size")
         if size is not None:
-            if isinstance(size, (int, float)):
-                text += f"\u3000\u3000\U0001F4BD {esc(fmt_size(size))}\n"
-            else:
-                text += f"\u3000\u3000\U0001F4BD {esc(size)}\n"
+            sz = esc(fmt_size(size)) if isinstance(size, (int, float)) else esc(size)
+            line += f"\u3000\u3000\U0001F4BE Size  : {sz}\n"
+        else:
+            line += f"\u3000\u3000\U0001F4BE Size  : -\n"
         stream = it.get("stream")
         download = it.get("download")
-        row = []
-        if stream and download:
-            row = [Button.url(f"#{idx} Stream: klik disini", stream),
-                   Button.url(f"#{idx} Download: klik disini", download)]
-        elif download:
-            row = [Button.url(f"#{idx} Download: klik disini", download)]
-        elif stream:
-            row = [Button.url(f"#{idx} Stream: klik disini", stream)]
-        if row:
-            buttons.append(row)
-    pg = pager(platform, page, n)
-    if pg:
-        buttons.extend(pg)
-    return text, (buttons or None)
+        if stream:
+            line += f"\u3000\u3000\U000025B6\uFE0F <a href=\"{esc(stream)}\">Stream</a>\n"
+        if download:
+            line += f"\u3000\u3000\U00002B07\uFE0F <a href=\"{esc(download)}\">Download</a>"
+        blocks.append(line)
+    body = "\n\n".join(blocks)
+    text = f"\u2705 <b>Berhasil di ekstrak</b>\n\n\U0001F4CA Total file: <b>{n}</b>\n\n{body}"
+    buttons = pager(platform, page, n) or None
+    return text, buttons
 
 
 def render_subtitle_page(results: list, platform: str, page: int) -> tuple[str, list | None]:
     n = len(results)
     start = (page - 1) * ITEMS_PER_PAGE
     chunk = results[start:start + ITEMS_PER_PAGE]
-    text = f"<b>\u2728 Berhasil ditemukan</b>\n\n\U0001F5C2\uFE0F Total hasil: <b>{n}</b>\n"
-    buttons = []
+    blocks = []
     for idx, r in enumerate(chunk, start=start + 1):
         title = esc(_stripped_title(r.get("title") or "-"))
-        text += f"\n{idx}. \U0001F4DC <b>{title}</b>\n"
+        line = f"<b>{idx}.</b> \U0001F4DD Title  : <b>{title}</b>\n"
         note = r.get("note") or ""
         if note:
-            text += f"\u3000\u3000\U0001F310 {esc(note)}\n"
-        if r.get("size"):
-            text += f"\u3000\u3000\U0001F4BD {esc(r['size'])}\n"
+            line += f"\u3000\u3000\U0001F310 Note  : {esc(note)}\n"
+        size = r.get("size") or "-"
+        line += f"\u3000\u3000\U0001F4BE Size  : {esc(size)}\n"
         if r.get("detailUrl"):
-            text += f"\u3000\u3000\U0001F4E5 Ambil: {r['detailUrl']}\n"
-    pg = pager(platform, page, n)
-    if pg:
-        buttons.extend(pg)
-    return text, (buttons or None)
+            line += f"\u3000\u3000\U0001F4E5 <a href=\"{esc(r['detailUrl'])}\">Ambil</a>"
+        blocks.append(line)
+    body = "\n\n".join(blocks)
+    text = f"\u2705 <b>Berhasil ditemukan</b>\n\n\U0001F4CA Total hasil: <b>{n}</b>\n\n{body}"
+    buttons = pager(platform, page, n) or None
+    return text, buttons
 
 
 # ------------------- subtitle scraper (subtitlecat.com) -------------------
@@ -364,59 +445,57 @@ async def handle_command(client, event, text: str):
         if waiting is not None:
             db.kv_del(f"res:{chat}")
             try:
-                await client.delete_messages(chat, [waiting])
+                await del_msg(chat, int(waiting))
             except Exception:
                 pass
-        await event.respond("\u2705 Dibatalkan.")
+        await send_msg(chat, "\u2705 Dibatalkan.")
         return
 
     if lower == "/start":
         db.kv_del(f"input:{chat}")
         db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
         if await is_member(client, uid):
-            await event.respond(START_TEXT, parse_mode="html")
+            await send_msg(chat, START_TEXT)
         else:
-            await event.respond(JOIN_TEXT, parse_mode="html", buttons=join_keyboard())
+            await send_msg(chat, JOIN_TEXT, buttons=join_keyboard())
         return
 
     if lower == "/menu":
         db.kv_del(f"input:{chat}")
         if not await is_member(client, uid):
-            await event.respond(JOIN_TEXT, parse_mode="html", buttons=join_keyboard())
+            await send_msg(chat, JOIN_TEXT, buttons=join_keyboard())
             return
         db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
-        await event.respond("<b>\U0001F4CB Menu</b>\n\nPilih fitur:", parse_mode="html",
-                            buttons=menu_keyboard(uid == OWNER_ID))
+        await send_msg(chat, "<b>\U0001F4CB Menu</b>\n\nPilih fitur:", buttons=menu_keyboard(uid == OWNER_ID))
         return
 
     if lower in ("/admin", "/stats", "/users", "/broadcast"):
         if uid != OWNER_ID:
-            await event.respond("\u274C Hanya owner.")
+            await send_msg(chat, "\u274C Hanya owner.")
             return
         db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
         if lower == "/broadcast":
             msg = text.split(" ", 1)[1].strip() if " " in text else ""
-            await event.respond(admin_panel("usage"))
+            await send_msg(chat, admin_panel("usage")["text"])
             if msg:
                 sent = 0
                 for target in db.all_user_ids():
                     try:
-                        await client.send_message(target, f"\U0001F4E2 <b>Broadcast</b>\n\n{esc(msg)}",
-                                                  parse_mode="html")
+                        await send_msg(target, f"\U0001F4E2 <b>Broadcast</b>\n\n{esc(msg)}")
                         sent += 1
                     except Exception:
                         continue
-                await event.respond(f"\u2705 Broadcast terkirim ke {sent} user.")
+                await send_msg(chat, f"\u2705 Broadcast terkirim ke {sent} user.")
             return
-        await event.respond(admin_panel(lower), parse_mode="html")
+        await send_msg(chat, admin_panel(lower)["text"])
         return
 
     if lower == "/help":
-        await event.respond(START_TEXT, parse_mode="html")
+        await send_msg(chat, START_TEXT)
         return
 
     if lower == "/id":
-        await event.respond(f"ID: <code>{uid}</code>", parse_mode="html")
+        await send_msg(chat, f"ID: <code>{uid}</code>")
         return
 
     # mode aktif? proses sebagai link
@@ -424,20 +503,24 @@ async def handle_command(client, event, text: str):
     if mode:
         db.kv_del(f"input:{chat}")
         if not await is_member(client, uid):
-            await event.respond(JOIN_TEXT, parse_mode="html", buttons=join_keyboard())
+            await send_msg(chat, JOIN_TEXT, buttons=join_keyboard())
             return
         db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
         await process_and_reply(event, mode, text)
         return
 
-    await event.respond("Perintah tidak dikenal. Gunakan /menu untuk melihat fitur.")
+    await send_msg(chat, "Perintah tidak dikenal. Gunakan /menu untuk melihat fitur.")
 
 
 async def process_and_reply(event, platform: str, payload: str):
     chat = event.chat_id
     txt = f"\u23F3 Processing..."
     db.log_request(event.sender_id or 0, platform, platform, payload, "ok")
-    processing = await event.respond(txt, buttons=None)
+    processing = await send_msg(chat, txt)
+    try:
+        db.kv_set(f"res:{chat}", processing["message_id"], ttl=INPUT_TTL)
+    except Exception:
+        pass
     try:
         if platform == "subtitle":
             results = await asyncio.to_thread(search_subtitle, payload)
@@ -455,11 +538,11 @@ async def process_and_reply(event, platform: str, payload: str):
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        await processing.edit(f"\u274C {esc(str(e)[:300])}", parse_mode="html")
+        await edit_msg(chat, processing["message_id"], f"\u274C {esc(str(e)[:300])}")
         db.log_request(event.sender_id or 0, platform, platform, payload, "error")
         return
     try:
-        await processing.edit(text, parse_mode="html", buttons=buttons)
+        await edit_msg(chat, processing["message_id"], text, buttons)
     except Exception:
         pass
 
@@ -473,39 +556,39 @@ async def handle_callback(client, event):
     msg_id = event.message_id
 
     if not raw:
-        await event.answer()
+        await answer_cb(event.id)
         return
     if raw == "noop":
-        await event.answer()
+        await answer_cb(event.id)
         return
     if raw == "cancel":
         db.kv_del(f"input:{chat}")
-        await event.answer("\u274C Dibatalkan")
-        buttons = menu_keyboard(uid == OWNER_ID)
-        await event.edit("<b>\U0001F4CB Menu</b>\n\nPilih fitur:", buttons=buttons, parse_mode="html")
+        await answer_cb(event.id, "\u274C Dibatalkan")
+        await edit_msg(chat, msg_id, "<b>\U0001F4CB Menu</b>\n\nPilih fitur:",
+                       menu_keyboard(uid == OWNER_ID))
         return
 
     if raw.startswith("menu:"):
         mode = raw[5:]
         if mode == "verify":
-            await event.answer("\u23F3 Memeriksa keanggotaan...")
+            await answer_cb(event.id, "\u23F3 Memeriksa keanggotaan...")
             if await is_member(client, uid):
-                await event.edit("<b>\u2705 Verifikasi berhasil!</b>\n\nAnda sudah join channel. Silakan pilih fitur:",
-                                 buttons=menu_keyboard(uid == OWNER_ID), parse_mode="html")
+                await edit_msg(chat, msg_id, "<b>\u2705 Verifikasi berhasil!</b>\n\nAnda sudah join channel. Silakan pilih fitur:",
+                               menu_keyboard(uid == OWNER_ID))
             else:
-                await event.edit("<b>\u274C Anda belum join channel!</b>\n\nSilakan join dulu, lalu klik Verifikasi:",
-                                 buttons=join_keyboard(), parse_mode="html")
+                await edit_msg(chat, msg_id, "<b>\u274C Anda belum join channel!</b>\n\nSilakan join dulu, lalu klik Verifikasi:",
+                               join_keyboard())
             return
         if mode == "admin":
             if uid != OWNER_ID:
-                await event.answer("Akses ditolak", alert=True)
+                await answer_cb(event.id, "Akses ditolak", alert=True)
                 return
             res = admin_panel("menu")
-            await event.edit(res["text"], parse_mode="html")
-            await event.answer()
+            await edit_msg(chat, msg_id, res["text"], [])
+            await answer_cb(event.id)
             return
         if mode not in ("ucshare", "slicedrive", "terabox", "subtitle"):
-            await event.answer("Mode tidak valid", alert=True)
+            await answer_cb(event.id, "Mode tidak valid", alert=True)
             return
         db.kv_set(f"input:{chat}", mode, ttl=INPUT_TTL)
         hints = {
@@ -514,10 +597,10 @@ async def handle_callback(client, event):
             "terabox": "Kirim link TeraBox:",
             "subtitle": "Kirim judul subtitle:",
         }
-        await event.answer()
+        await answer_cb(event.id)
         label = PLATFORM_LABEL[mode]
-        await event.edit(f"\U0001F9ED <b>{label}</b>\n\n{hints[mode]}\n\n(Jika ingin mengganti mode, ketik /menu)",
-                         buttons=cancel_keyboard(), parse_mode="html")
+        await edit_msg(chat, msg_id, f"\U0001F9ED <b>{label}</b>\n\n{hints[mode]}\n\n(Jika ingin mengganti mode, ketik /menu)",
+                       cancel_keyboard())
         return
 
     if raw.startswith("page:"):
@@ -527,19 +610,19 @@ async def handle_callback(client, event):
         page = int(page_raw) if page_raw.isdigit() else 1
         data = db.kv_get(f"page:{chat}:{platform}", PAGE_TTL)
         if not data:
-            await event.answer("Sesi berakhir. Kirim ulang dari menu.", alert=True)
+            await answer_cb(event.id, "Sesi berakhir. Kirim ulang dari menu.", alert=True)
             return
         items = data["items"]
         pages = max(1, -(-len(items) // ITEMS_PER_PAGE))
         if page < 1 or page > pages:
-            await event.answer("Halaman tidak valid.", alert=True)
+            await answer_cb(event.id, "Halaman tidak valid.", alert=True)
             return
         if platform == "subtitle":
             text, buttons = render_subtitle_page(items, platform, page)
         else:
             text, buttons = render_media_page(items, platform, page)
-        await event.edit(text, buttons=buttons, parse_mode="html")
-        await event.answer()
+        await edit_msg(chat, msg_id, text, buttons)
+        await answer_cb(event.id)
         return
 
 
@@ -579,7 +662,7 @@ async def main() -> None:
     @client.on(events.NewMessage)
     async def on_message(event):
         text = (event.raw_text or "").strip()
-        if not text:
+        if not text or event.out:
             return
         try:
             await handle_command(client, event, text)
@@ -587,7 +670,7 @@ async def main() -> None:
             print(f"[BOT] on_message error: {e!r}", file=sys.stderr)
             traceback.print_exc()
             try:
-                await event.respond(f"\u274C {esc(str(e))[:200]}")
+                await send_msg(event.chat_id, f"\u274C {esc(str(e))[:200]}")
             except Exception:
                 pass
 
@@ -599,7 +682,7 @@ async def main() -> None:
             print(f"[BOT] on_callback error: {e!r}", file=sys.stderr)
             traceback.print_exc()
             try:
-                await event.answer("Terjadi kesalahan.", alert=True)
+                await answer_cb(event.id, "Terjadi kesalahan.", alert=True)
             except Exception:
                 pass
 
