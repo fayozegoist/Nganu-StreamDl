@@ -1027,22 +1027,26 @@ def _media_info(token: str) -> dict | None:
 _PLAYER_HTML = """<!doctype html>
 <html lang="id"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b1220">
 <title>{title}</title>
 <style>
-  * {{ box-sizing: border-box; }}
+  * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
   html, body {{ margin: 0; background: #000; color: #fff;
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }}
   video {{ display: block; width: 100%; max-height: 86vh; background: #000; }}
-  .bar {{ display: flex; align-items: center; gap: 12px; padding: 10px 12px; }}
-  .bar .name {{ flex: 1; min-width: 0; font-size: 14px; font-weight: 600;
+  .bar {{ display: flex; align-items: center; gap: 12px; padding: 12px;
+    background: #0b1220; }}
+  .bar .name {{ flex: 1; min-width: 0; font-size: 14px; font-weight: 700;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-  .dl {{ padding: 9px 16px; border-radius: 8px; background: rgba(255,255,255,.14);
-    color: #fff; text-decoration: none; font-size: 14px; font-weight: 600; }}
+  .dl {{ padding: 10px 22px; border-radius: 10px; text-decoration: none;
+    font-size: 14px; font-weight: 700; color: #fff; flex-shrink: 0;
+    background: linear-gradient(135deg, #2a7dff, #00c2ff);
+    box-shadow: 0 2px 10px rgba(42,125,255,.4); }}
   .err {{ color: #ffd6d6; padding: 18px; font-size: 14px; line-height: 1.5; }}
 </style>
 </head><body>
-<video id="v" controls playsinline preload="auto" src="{src}"></video>
+<video id="v" src="{src}" controls autoplay muted playsinline preload="auto"></video>
 <div class="bar">
   <span class="name" id="name">{title}</span>
   <a class="dl" href="{dl}">&#8681; Download</a>
@@ -1050,6 +1054,7 @@ _PLAYER_HTML = """<!doctype html>
 <script>
   var v = document.getElementById('v');
   var name = document.getElementById('name');
+  document.addEventListener('click', function () {{ if (v.muted) v.muted = false; }});
   v.addEventListener('error', function () {{
     name.textContent = 'Gagal memuat video. Link mungkin sudah kedaluwarsa atau format tidak didukung. Gunakan tombol Download.';
   }});
@@ -1078,20 +1083,28 @@ def m_player(token: str):
     if not target:
         return _err(404, "Tidak ada sumber stream/download.")
 
-    headers = {"User-Agent": UA}
+    headers = {"User-Agent": UA, "Accept": "*/*"}
     referer = info.get("referer")
     if referer:
         headers["Referer"] = referer
     rng = request.headers.get("Range")
     if rng:
         headers["Range"] = rng
-    try:
-        upstream = urllib.request.urlopen(
-            urllib.request.Request(target, headers=headers), timeout=60)
-    except urllib.error.HTTPError as e:
-        return _err(502, f"CDN menolak (HTTP {e.code}).")
-    except Exception as e:
-        return _err(502, f"CDN gagal: {e}")
+
+    upstream = None
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(target, headers=headers)
+            upstream = urllib.request.urlopen(req, timeout=60)
+            break
+        except urllib.error.HTTPError as e:
+            last_err = f"CDN menolak (HTTP {e.code})."
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(1.5 * attempt)
+    if upstream is None:
+        return _err(502, last_err or "CDN gagal.")
 
     def gen():
         try:
@@ -1111,16 +1124,16 @@ def m_player(token: str):
     mime = upstream.headers.get("Content-Type") or mime_for(info.get("f") or "video.mp4")
     if not mime.startswith(("video/", "audio/", "image/")):
         mime = mime_for(info.get("f") or "video.mp4")
-    resp = Response(gen(), content_type=mime)
+    resp = Response(gen(), status=upstream.status, content_type=mime)
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "no-store"
     cl = upstream.headers.get("Content-Length")
     if cl:
         resp.headers["Content-Length"] = str(cl)
     cr = upstream.headers.get("Content-Range")
     if cr:
         resp.headers["Content-Range"] = cr
-    resp.headers["Accept-Ranges"] = "bytes"
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Cache-Control"] = "no-store"
     if dl:
         safe = (info.get("f") or "video.mp4").replace('"', "_")
         resp.headers["Content-Disposition"] = f'attachment; filename="{safe}"'

@@ -373,8 +373,7 @@ async def handle_command(client, event, text: str):
         db.kv_del(f"input:{chat}")
         db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
         if await is_member(client, uid):
-            await event.respond(START_TEXT + "\n\nKetik <b>/menu</b> untuk melihat menu fitur.",
-                                parse_mode="html")
+            await event.respond(START_TEXT, parse_mode="html")
         else:
             await event.respond(JOIN_TEXT, parse_mode="html", buttons=join_keyboard())
         return
