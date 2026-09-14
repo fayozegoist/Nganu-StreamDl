@@ -51,6 +51,7 @@ ITEMS_PER_PAGE = 7
 NAME_MAX = 60
 INPUT_TTL = 5 * 60 * 1000
 PAGE_TTL = 10 * 60 * 1000
+TERA_COOLDOWN_MS = 60 * 1000
 
 ICONS = {"video": "\U0001F3AC", "audio": "\U0001F3B5", "photo": "\U0001F5BC\uFE0F", "file": "\U0001F4C4"}
 PLATFORM_LABEL = {
@@ -88,6 +89,19 @@ def fmt_size(size) -> str:
 def _stripped_title(title: str, maxlen: int = NAME_MAX) -> str:
     title = re.sub(r"\s+", " ", str(title or "").strip())
     return title if len(title) <= maxlen else title[:maxlen] + "\u2026"
+
+
+def tera_cooldown_remaining(chat: int) -> int | None:
+    last = db.kv_get(f"cd:tb:{chat}")
+    if isinstance(last, (int, float)):
+        elapsed = int(time.time() * 1000) - int(last)
+        if elapsed < TERA_COOLDOWN_MS:
+            return max(1, (TERA_COOLDOWN_MS - elapsed) // 1000)
+    return None
+
+
+def tera_cooldown_set(chat: int) -> None:
+    db.kv_set(f"cd:tb:{chat}", int(time.time() * 1000), ttl=TERA_COOLDOWN_MS)
 
 
 _STYLES = {"primary", "success", "danger"}
@@ -514,6 +528,12 @@ async def handle_command(client, event, text: str):
 
 async def process_and_reply(event, platform: str, payload: str):
     chat = event.chat_id
+    if platform == "terabox":
+        remain = tera_cooldown_remaining(chat)
+        if remain:
+            await send_msg(chat,
+                           f"\u23F3 Jeda 60 detik... Tunggu {remain} detik lagi sebelum ekstrak link TeraBox.")
+            return
     txt = f"\u23F3 Processing..."
     db.log_request(event.sender_id or 0, platform, platform, payload, "ok")
     processing = await send_msg(chat, txt)
@@ -543,6 +563,8 @@ async def process_and_reply(event, platform: str, payload: str):
         return
     try:
         await edit_msg(chat, processing["message_id"], text, buttons)
+        if platform == "terabox":
+            tera_cooldown_set(chat)
     except Exception:
         pass
 
