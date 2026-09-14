@@ -180,11 +180,12 @@ def render_media_page(items: list, platform: str, page: int) -> tuple[str, list 
         download = it.get("download")
         row = []
         if stream and download:
-            row = [Button.url(f"#{idx} Stream", stream), Button.url(f"#{idx} Download", download)]
+            row = [Button.url(f"#{idx} Stream: klik disini", stream),
+                   Button.url(f"#{idx} Download: klik disini", download)]
         elif download:
-            row = [Button.url(f"#{idx} Download", download)]
+            row = [Button.url(f"#{idx} Download: klik disini", download)]
         elif stream:
-            row = [Button.url(f"#{idx} Stream", stream)]
+            row = [Button.url(f"#{idx} Stream: klik disini", stream)]
         if row:
             buttons.append(row)
     pg = pager(platform, page, n)
