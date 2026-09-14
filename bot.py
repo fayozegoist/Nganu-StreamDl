@@ -320,12 +320,12 @@ def render_subtitle_page(results: list, platform: str, page: int) -> tuple[str, 
     rows: list[list[dict]] = []
     for idx, r in enumerate(chunk, start=start + 1):
         title = esc(_stripped_title(r.get("title") or "-"))
-        line = f"<b>{idx}.</b> {title}\n"
+        line = f"<b>{idx}.</b> \U0001F4DD Judul: <b>{title}</b>\n"
         m = re.search(r"(\d+)", r.get("downloads") or "")
         dl_count = m.group(1) if m else "-"
-        line += f"\u3000\u3000Total download: <b>{dl_count}</b>\n"
+        line += f"\u3000\u3000\U0001F4E5 Total Download: <b>{dl_count}</b>\n"
         if r.get("detailUrl"):
-            rows.append([_b("\u2B07\uFE0F Download", data=f"sub:{idx}", style="success")])
+            rows.append([_b(f"\u2B07\uFE0F {idx}. Download", data=f"sub:{idx}", style="success")])
         blocks.append(line)
     body = "\n\n".join(blocks)
     text = f"\u2705 <b>Berhasil ditemukan</b>\n\n\U0001F4CA Total hasil: <b>{n}</b>\n\n{body}"
