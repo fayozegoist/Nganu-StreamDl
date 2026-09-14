@@ -528,7 +528,8 @@ async def handle_command(client, event, text: str):
 
 async def process_and_reply(event, platform: str, payload: str):
     chat = event.chat_id
-    if platform == "terabox":
+    uid = event.sender_id or 0
+    if platform == "terabox" and uid != OWNER_ID:
         remain = tera_cooldown_remaining(chat)
         if remain:
             await send_msg(chat,
@@ -563,7 +564,7 @@ async def process_and_reply(event, platform: str, payload: str):
         return
     try:
         await edit_msg(chat, processing["message_id"], text, buttons)
-        if platform == "terabox":
+        if platform == "terabox" and uid != OWNER_ID:
             tera_cooldown_set(chat)
     except Exception:
         pass
