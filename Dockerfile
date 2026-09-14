@@ -10,8 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN useradd -m appuser && mkdir -p /app/data/uploads && chown -R appuser:appuser /app /app/data
-USER appuser
+RUN mkdir -p /app/data/uploads
 
 EXPOSE 8000
 
