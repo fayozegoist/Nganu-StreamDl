@@ -158,6 +158,59 @@ def all_user_ids() -> list[int]:
     return [int(r["id"]) for r in rows]
 
 
+def count_users() -> int:
+    conn = get_conn()
+    return conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"] or 0
+
+
+def list_users_detailed(page_size: int, offset: int) -> list:
+    """User per halaman + rekap request per platform (hanya status='ok')."""
+    conn = get_conn()
+    users = conn.execute(
+        "SELECT id, username, first_name, request_count, last_active "
+        "FROM users ORDER BY request_count DESC, last_active DESC LIMIT ? OFFSET ?",
+        (page_size, offset),
+    ).fetchall()
+    if not users:
+        return []
+    ids = [int(u["id"]) for u in users]
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT user_id, platform, COUNT(*) AS c FROM request_logs "
+        f"WHERE user_id IN ({placeholders}) AND status = 'ok' "
+        f"GROUP BY user_id, platform",
+        ids,
+    ).fetchall()
+    by_user: dict = {}
+    for r in rows:
+        by_user.setdefault(int(r["user_id"]), {})[r["platform"]] = int(r["c"])
+    out = []
+    for u in users:
+        d = dict(u)
+        d["platforms"] = by_user.get(int(u["id"]), {})
+        out.append(d)
+    return out
+
+
+_reset_done = False
+
+
+def reset_if_requested() -> None:
+    """Sekali per proses: wipe users + request_logs jika env RESET_USERS='1'."""
+    global _reset_done
+    if _reset_done:
+        return
+    _reset_done = True
+    if os.environ.get("RESET_USERS") == "1":
+        conn = get_conn()
+        with conn:
+            conn.execute("DELETE FROM request_logs")
+            conn.execute("DELETE FROM users")
+
+
+reset_if_requested()
+
+
 def now_ms() -> int:
     import time
     return int(time.time() * 1000)

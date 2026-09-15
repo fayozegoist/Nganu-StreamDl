@@ -417,9 +417,14 @@ def admin_panel(section: str) -> dict:
         text = ("<b>\U0001F44B Admin Panel</b>\n\n"
                 "/stats \u2014 Statistik\n"
                 "/users \u2014 Daftar user\n"
+                "/leaderboard \u2014 Papan peringkat\n"
                 "/broadcast &lt;text&gt; \u2014 Kirim pesan ke semua user")
     else:
-        text = "<b>\U0001F44B Admin Panel</b>\n\n/stats \u2014 Statistik\n/users \u2014 Daftar user\n/broadcast &lt;text&gt; \u2014 Pesan massal"
+        text = ("<b>\U0001F44B Admin Panel</b>\n\n"
+                "/stats \u2014 Statistik\n"
+                "/users \u2014 Daftar user\n"
+                "/leaderboard \u2014 Papan peringkat\n"
+                "/broadcast &lt;text&gt; \u2014 Pesan massal")
     return {"text": text, "buttons": None}
 
 
@@ -428,6 +433,47 @@ def fmt_last_active(ms: int) -> str:
         return "-"
     t = time.localtime(int(ms) / 1000 + 7 * 3600)
     return time.strftime("%d/%m %H:%M", t)
+
+
+LEADERBOARD_PAGE_SIZE = 5
+_LEADERBOARD_PLATFORMS = (
+    ("terabox", "Terabox"),
+    ("slicedrive", "Videy"),
+    ("ucshare", "UC Share"),
+    ("subtitle", "Subtitle"),
+)
+
+
+def build_leaderboard_page(page: int) -> tuple[str, list | None]:
+    size = LEADERBOARD_PAGE_SIZE
+    total = db.count_users()
+    pages = max(1, -(-total // size))
+    page = max(1, min(page, pages))
+    rows = db.list_users_detailed(size, (page - 1) * size)
+    head = f"<b>\U0001F3C6 Leaderboard</b>\n\n\U0001F4CA Total: <b>{total}</b>\n\n"
+    if not rows:
+        return head + "Belum ada user.", None
+    lines = []
+    num = (page - 1) * size
+    for r in rows:
+        num += 1
+        name = esc(r.get("first_name") or "-")
+        uname = esc(r.get("username") or "-")
+        pd = r.get("platforms") or {}
+        segs = " \u00B7 ".join(f"{label}: {pd.get(key, 0)}" for key, label in _LEADERBOARD_PLATFORMS)
+        last = fmt_last_active(r.get("last_active"))
+        lines.append(f"<b>{num}.</b> \U0001F464 {name} (@{uname})\n"
+                     f"\u3000\u3000\u2705 {segs}\n"
+                     f"\u3000\u3000\U0001F550 Aktif: {last}")
+    text = head + "\n\n".join(lines)
+    row = []
+    if page > 1:
+        row.append(_b("\u2B05 Prev", data=f"lb:{page - 1}", style="primary"))
+    row.append(_b(f"{page}/{pages}", data="noop"))
+    if page < pages:
+        row.append(_b("Next \u27A1", data=f"lb:{page + 1}", style="success"))
+    buttons = [row] if len(row) > 1 else None
+    return text, buttons
 
 
 # ------------------- link processing -------------------
@@ -491,7 +537,6 @@ async def handle_command(client, event, text: str):
 
     if lower == "/start":
         db.kv_del(f"input:{chat}")
-        db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
         if await is_member(client, uid):
             await send_msg(chat, START_TEXT)
         else:
@@ -503,15 +548,13 @@ async def handle_command(client, event, text: str):
         if not await is_member(client, uid):
             await send_msg(chat, JOIN_TEXT, buttons=join_keyboard())
             return
-        db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
         await send_msg(chat, "<b>\U0001F4CB Menu</b>\n\nPilih fitur:", buttons=menu_keyboard(uid == OWNER_ID))
         return
 
-    if lower in ("/admin", "/stats", "/users", "/broadcast"):
+    if lower in ("/admin", "/stats", "/users", "/leaderboard", "/broadcast"):
         if uid != OWNER_ID:
             await send_msg(chat, "\u274C Hanya owner.")
             return
-        db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
         if lower == "/broadcast":
             msg = text.split(" ", 1)[1].strip() if " " in text else ""
             await send_msg(chat, admin_panel("usage")["text"])
@@ -524,6 +567,10 @@ async def handle_command(client, event, text: str):
                     except Exception:
                         continue
                 await send_msg(chat, f"\u2705 Broadcast terkirim ke {sent} user.")
+            return
+        if lower == "/leaderboard":
+            text, buttons = build_leaderboard_page(1)
+            await send_msg(chat, text, buttons)
             return
         await send_msg(chat, admin_panel(lower)["text"])
         return
@@ -543,7 +590,6 @@ async def handle_command(client, event, text: str):
         if not await is_member(client, uid):
             await send_msg(chat, JOIN_TEXT, buttons=join_keyboard())
             return
-        db.upsert_user(uid, getattr(event.sender, "username", None), getattr(event.sender, "first_name", None))
         await process_and_reply(event, mode, text)
         return
 
@@ -560,7 +606,6 @@ async def process_and_reply(event, platform: str, payload: str):
                            f"\u23F3 Jeda 60 detik... Tunggu {remain} detik lagi sebelum ekstrak link TeraBox.")
             return
     txt = f"\u23F3 Processing..."
-    db.log_request(event.sender_id or 0, platform, platform, payload, "ok")
     processing = await send_msg(chat, txt)
     try:
         db.kv_set(f"res:{chat}", processing["message_id"], ttl=INPUT_TTL)
@@ -584,8 +629,11 @@ async def process_and_reply(event, platform: str, payload: str):
         raise
     except Exception as e:
         await edit_msg(chat, processing["message_id"], f"\u274C {esc(str(e)[:300])}")
-        db.log_request(event.sender_id or 0, platform, platform, payload, "error")
         return
+    if uid != OWNER_ID:
+        db.log_request(uid, platform, platform, payload, "ok")
+        db.upsert_user(uid, getattr(event.sender, "username", None),
+                       getattr(event.sender, "first_name", None))
     try:
         await edit_msg(chat, processing["message_id"], text, buttons)
         if platform == "terabox" and uid != OWNER_ID:
@@ -703,6 +751,19 @@ async def handle_callback(client, event):
             print(f"[BOT] sub send error: {e!r}", file=sys.stderr)
             await send_msg(chat, f"\u274C Gagal kirim subtitle: {esc(str(e))[:200]}")
         return
+
+    if raw.startswith("lb:"):
+        if uid != OWNER_ID:
+            await answer_cb(event.id, "Akses ditolak", alert=True)
+            return
+        page_raw = raw.split(":", 1)[1]
+        page = int(page_raw) if page_raw.isdigit() else 1
+        text, buttons = build_leaderboard_page(page)
+        await edit_msg(chat, msg_id, text, buttons)
+        await answer_cb(event.id)
+        return
+
+    await answer_cb(event.id)
 
 
 def _load_session() -> StringSession | None:
