@@ -1,0 +1,9 @@
+.env
+.env.*
+*.session
+*.session-journal
+users.json
+nganu
+bin/
+__pycache__/
+*.pyc
