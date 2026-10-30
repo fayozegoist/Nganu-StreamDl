@@ -36,7 +36,7 @@ func subGet(u string) (string, error) {
 	req, _ := http.NewRequest("GET", u, nil)
 	req.Header.Set("User-Agent", subUA)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	resp, err := scrapeHTTP.Do(req)
+	resp, err := doScrape(req)
 	if err != nil {
 		return "", err
 	}

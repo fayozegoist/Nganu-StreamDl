@@ -622,6 +622,68 @@ async def _send(payload: dict) -> dict:
                     pass
 
 
+GID_PROXIES = [p.strip() for p in (os.environ.get("GID_PROXIES") or "").split(",") if p.strip()]
+_gid_rr = {"i": 0}
+_proxy_cache = {"mtime": 0.0, "list": []}
+
+
+def _proxy_url(p: str) -> str:
+    """Normalisasi 'ip:port:user:pass' atau URL penuh."""
+    if p.startswith("http"):
+        return p
+    parts = p.split(":")
+    if len(parts) == 4:
+        ip, port, user, pw = parts
+        return f"http://{user}:{pw}@{ip}:{port}"
+    return "http://" + p
+
+
+def _proxy_list() -> list[str]:
+    """proxies.json (dikelola /proxy di bot Go) > env GID_PROXIES."""
+    try:
+        mt = os.path.getmtime("proxies.json")
+    except OSError:
+        return GID_PROXIES
+    if mt != _proxy_cache["mtime"]:
+        try:
+            with open("proxies.json") as f:
+                _proxy_cache["list"] = [p for p in json.load(f) if p]
+            _proxy_cache["mtime"] = mt
+        except Exception:
+            return GID_PROXIES
+    return _proxy_cache["list"]
+
+
+def gid_fetch(link: str) -> dict:
+    """Resolve terabox via getindevice.com — butuh TLS impersonate + proxy
+    (Cloudflare memblokir fingerprint Go/curl dan IP VPS)."""
+    from curl_cffi import requests as creq
+
+    ref = "https://getindevice.com/terabox-downloader/"
+    headers = {"Referer": ref}
+    proxies = _proxy_list() or [None]
+    random.shuffle(proxies)
+    for px in proxies:
+        try:
+            s = creq.Session(impersonate="chrome", proxy=_proxy_url(px) if px else None,
+                             timeout=40)
+            s.get(ref)
+            tok = s.get(f"https://getindevice.com/api/token/?_t={int(time.time() * 1000)}",
+                        headers=headers).json()["token"]
+            r = s.post("https://getindevice.com/api/download/",
+                       headers={**headers, "Origin": "https://getindevice.com",
+                                "Content-Type": "application/json",
+                                "x-request-token": tok},
+                       json={"url": link})
+            d = r.json()
+            if any(d.get(k) for k in ("videos", "photos", "audios")):
+                return d
+            last = d
+        except Exception as e:
+            last = str(e)[:120]
+    raise ValueError(f"gid gagal semua proxy: {last}")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -637,6 +699,15 @@ class Handler(BaseHTTPRequestHandler):
             pass  # pemanggil sudah timeout/putus — abaikan
 
     def do_GET(self):
+        if self.path.startswith("/gid"):
+            link = (parse_qs(urlparse(self.path).query).get("url") or [""])[0]
+            try:
+                data = gid_fetch(link)
+                self._reply(json.dumps(data).encode(), "application/json")
+            except Exception as e:
+                self._reply(json.dumps({"error": str(e)[:200]}).encode(),
+                            "application/json")
+            return
         if self.path.startswith("/cancel"):
             jid = (parse_qs(urlparse(self.path).query).get("job_id") or [""])[0]
             ev = cancel_event(jid)

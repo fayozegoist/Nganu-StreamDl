@@ -49,13 +49,13 @@ func videyGet(url string, headers map[string]string) (*http.Response, error) {
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	return scrapeHTTP.Do(req)
+	return doScrape(req)
 }
 
 func videyHead(url string) (*http.Response, error) {
 	req, _ := http.NewRequest("HEAD", url, nil)
 	req.Header.Set("User-Agent", uaString)
-	return scrapeHTTP.Do(req)
+	return doScrape(req)
 }
 
 func resolveVidey(link string) ([]Item, error) {
@@ -124,7 +124,7 @@ func resolveVidey(link string) ([]Item, error) {
 		req, _ := http.NewRequest("GET", cand, nil)
 		req.Header.Set("User-Agent", uaString)
 		req.Header.Set("Range", "bytes=0-64")
-		if resp, err := scrapeHTTP.Do(req); err == nil {
+		if resp, err := doScrape(req); err == nil {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode < 400 {
@@ -157,7 +157,7 @@ func headSize(url string) int64 {
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", uaString)
 	req.Header.Set("Range", "bytes=0-0")
-	if resp, err := scrapeHTTP.Do(req); err == nil {
+	if resp, err := doScrape(req); err == nil {
 		defer resp.Body.Close()
 		io.Copy(io.Discard, resp.Body)
 		if m := vRangeRe.FindStringSubmatch(resp.Header.Get("Content-Range")); m != nil {
@@ -294,7 +294,7 @@ func headSizeRef(url, referer string) int64 {
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}
-	if resp, err := scrapeHTTP.Do(req); err == nil {
+	if resp, err := doScrape(req); err == nil {
 		defer resp.Body.Close()
 		if resp.StatusCode < 400 {
 			if n, err2 := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64); err2 == nil {

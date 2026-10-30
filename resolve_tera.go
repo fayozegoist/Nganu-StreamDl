@@ -108,38 +108,25 @@ func fetchTbox(link string) ([]Item, error) {
 	return items, nil
 }
 
-// ---------- fallback: getindevice.com ----------
+// ---------- getindevice.com via uploader lokal ----------
+// CF memblokir IP VPS + fingerprint Go, jadi request dijalankan uploader.py
+// (curl_cffi impersonate Chrome + rotasi proxy).
 
-const gidBase = "https://getindevice.com"
-const gidUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-
-var gidHeaders = map[string]string{
-	"User-Agent": gidUA,
-	"Referer":    gidBase + "/terabox-downloader/",
-	"Origin":     gidBase,
-}
-
-func gidToken() (string, error) {
-	u := fmt.Sprintf("%s/api/token/?_t=%d", gidBase, time.Now().UnixMilli())
-	req, _ := http.NewRequest("GET", u, nil)
-	for k, v := range gidHeaders {
-		req.Header.Set(k, v)
-	}
-	resp, err := scrapeHTTP.Do(req)
+func gidResolve(link string) (map[string]any, error) {
+	u := uploaderURL + "/gid?url=" + url.QueryEscape(link)
+	resp, err := scrapeHTTP.Get(u)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	var r struct {
-		Token string `json:"token"`
+	var out map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&out); err != nil {
+		return nil, err
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return "", err
+	if e, ok := out["error"].(string); ok && e != "" {
+		return nil, fmt.Errorf("gid: %s", e)
 	}
-	if r.Token == "" {
-		return "", fmt.Errorf("token kosong")
-	}
-	return r.Token, nil
+	return out, nil
 }
 
 type gidItem struct {
@@ -150,26 +137,6 @@ type gidItem struct {
 	URL     string `json:"url"`
 	Sig     string `json:"sig"`
 	HLSURL  string `json:"hlsStreamUrl"`
-}
-
-func gidResolve(link, token string) (map[string]any, error) {
-	payload := strings.NewReader(fmt.Sprintf(`{"url":%q}`, link))
-	req, _ := http.NewRequest("POST", gidBase+"/api/download/", payload)
-	for k, v := range gidHeaders {
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-request-token", token)
-	resp, err := scrapeHTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var out map[string]any
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&out); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func fixHLS(u string) string {
@@ -193,11 +160,7 @@ func gidFallback(link string) ([]Item, error) {
 }
 
 func gidResolveOnce(link string) ([]Item, error) {
-	token, err := gidToken()
-	if err != nil {
-		return nil, err
-	}
-	data, err := gidResolve(link, token)
+	data, err := gidResolve(link)
 	if err != nil {
 		return nil, err
 	}
@@ -346,9 +309,7 @@ var segInnerRe = regexp.MustCompile(`(?i)^https?://[^/]*freeterabox\.com/video/`
 
 func fetchText(u string) (string, error) {
 	req, _ := http.NewRequest("GET", u, nil)
-	for k, v := range gidHeaders {
-		req.Header.Set(k, v)
-	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0")
 	resp, err := scrapeHTTP.Do(req)
 	if err != nil {
 		return "", err

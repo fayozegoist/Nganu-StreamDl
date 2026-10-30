@@ -27,7 +27,7 @@ func ucAPI(path string, payload map[string]any, headers map[string]string) (map[
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := scrapeHTTP.Do(req)
+	resp, err := doScrape(req)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +154,7 @@ func ucMedia(pwdID, stoken string, f ucFile) Item {
 	req.Header.Set("Referer", ucOrigin+"/")
 
 	it := Item{Title: f.FileName, Size: f.Size}
-	resp, err := scrapeHTTP.Do(req)
+	resp, err := doScrape(req)
 	if err != nil {
 		return it
 	}

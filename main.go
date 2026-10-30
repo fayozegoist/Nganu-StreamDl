@@ -515,6 +515,13 @@ func handle(m *Message) {
 		}
 		sendHTML(chat, "🚫 Membatalkan "+strconv.Itoa(len(jobs))+" upload...")
 		return
+	case "/proxy":
+		if uid != ownerID {
+			sendHTML(chat, "⛔ Khusus admin.")
+			return
+		}
+		handleProxyCmd(chat, arg)
+		return
 	case "/infovps":
 		if uid != ownerID {
 			sendHTML(chat, "⛔ Khusus admin.")
@@ -577,9 +584,15 @@ func process(chat, uid int64, platform, payload string) {
 		fail(err)
 		return
 	}
-	log.Printf("resolve %s: %d item", platform, len(items))
+	if platform != "terabox" { // terabox sudah dilog resolveTerabox (sumber platform)
+		log.Printf("resolve %s: %d item", platform, len(items))
+	}
 	if len(items) == 0 {
-		fail(fmt.Errorf("tidak ada file ditemukan"))
+		if platform == "terabox" {
+			fail(fmt.Errorf("tidak ada file ditemukan — kalau ini share folder, resolver cadangan tak bisa masuk folder; coba lagi sebentar / laporkan ke admin"))
+		} else {
+			fail(fmt.Errorf("tidak ada file ditemukan"))
+		}
 		return
 	}
 	token := st.setSession(chat, &Session{Platform: platform, Items: items})
@@ -833,6 +846,7 @@ func main() {
 	if botToken == "" {
 		log.Fatal("BOT_TOKEN belum diisi")
 	}
+	loadProxies()
 	botUsername = getBotUsername()
 	if botUsername == "" {
 		log.Println("getMe gagal — deep link download tidak akan berfungsi")
