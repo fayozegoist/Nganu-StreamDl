@@ -7,3 +7,5 @@ nganu
 bin/
 __pycache__/
 *.pyc
+proxies.json
+proxies.json.tmp
